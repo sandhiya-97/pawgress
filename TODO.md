@@ -9,3 +9,12 @@
 - [x] Add playful progress celebrations and micro-interactions such as mascot reactions, animated meters, badges, and completion effects.
 - [x] Make navigation and layouts responsive for desktop, tablet, and mobile while retaining the glassmorphic visual hierarchy.
 - [x] Provide accessible interaction states, keyboard usability, reduced-motion support, and readable contrast within the reference-inspired aesthetic.
+
+## Publish-readiness outcomes
+
+- [x] Each user can choose and update a private nickname in their own workspace.
+- [x] Each authenticated user’s mission completion, notes, and projects are persisted in the backend under that user’s identity.
+- [x] Guest browser state is isolated from authenticated accounts and is never uploaded into a newly signed-in user’s profile.
+- [x] Account switching signs the previous user out of the visible workspace and restores guest state without exposing the previous account’s data.
+- [x] Frontend and backend are wired through authenticated session, profile read, profile update, logout, health, and OAuth callback endpoints.
+- [x] Managed database, production build, container deployment, API/static routing, and public health-check configuration are declared for publishing.

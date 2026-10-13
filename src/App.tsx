@@ -36,6 +36,8 @@ import {
   X,
   Zap,
 } from 'lucide-react';
+import { supabase, supabaseRedirectUrl } from './lib/supabase';
+import type { FieldNote, PawgressUserData, Project } from './types';
 
 type View = 'today' | 'month' | 'projects' | 'vault' | 'progress';
 type IconType = ComponentType<{ size?: number; strokeWidth?: number; className?: string }>;
@@ -59,27 +61,11 @@ type VaultItem = {
   duration: string;
 };
 
-type Project = {
-  id: string;
-  title: string;
-  description: string;
-  link: string;
-  category: string;
-  status: 'Idea' | 'In progress' | 'Shipped';
-};
-
 type AccountState = {
   loading: boolean;
   authenticated: boolean;
   userId?: string;
   email?: string;
-};
-
-type RemoteProfile = {
-  nickname: string;
-  completed: number[];
-  notes: Record<number, string>;
-  projects: Project[];
 };
 
 const MISSIONS: Mission[] = [
@@ -138,6 +124,7 @@ const STORAGE_NOTES = 'pawgress-month-one-dsa-notes';
 const STORAGE_PROJECTS = 'pawgress-projects';
 const STORAGE_NAME = 'pawgress-user-name';
 const STORAGE_ACCOUNT_ID = 'pawgress-account-id';
+const GUEST_SCOPE = 'guest';
 
 function readStorage<T>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
@@ -146,6 +133,90 @@ function readStorage<T>(key: string, fallback: T): T {
     return value ? (JSON.parse(value) as T) : fallback;
   } catch {
     return fallback;
+  }
+}
+
+function scopedStorageKey(key: string, scope: string) {
+  return `${key}:${scope || GUEST_SCOPE}`;
+}
+
+function clientId() {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function readLocalData(scope: string): PawgressUserData {
+  const storedNotes = readStorage<unknown>(scopedStorageKey(STORAGE_NOTES, scope), readStorage(STORAGE_NOTES, {}));
+  const now = new Date().toISOString();
+  const notes: FieldNote[] = Array.isArray(storedNotes)
+    ? storedNotes as FieldNote[]
+    : Object.entries((storedNotes ?? {}) as Record<string, string>).map(([day, content]) => ({ id: `local-note-${day}`, day: Number(day), content, createdAt: now, updatedAt: now }));
+  const projects = readStorage<Project[]>(scopedStorageKey(STORAGE_PROJECTS, scope), readStorage(STORAGE_PROJECTS, [])).map((project) => ({ ...project, id: project.id.startsWith('project-') ? clientId() : project.id }));
+  return {
+    nickname: readStorage(scopedStorageKey(STORAGE_NAME, scope), readStorage(STORAGE_NAME, '')),
+    completed: readStorage<number[]>(scopedStorageKey(STORAGE_COMPLETED, scope), readStorage(STORAGE_COMPLETED, [])),
+    notes,
+    projects,
+  };
+}
+
+function notesByDay(notes: FieldNote[]) {
+  return new Map(notes.map((note) => [note.day, note]));
+}
+
+function mergeUserData(remote: PawgressUserData, local: PawgressUserData): PawgressUserData {
+  const mergedNotes = notesByDay(remote.notes);
+  local.notes.forEach((note) => { if (!mergedNotes.has(note.day)) mergedNotes.set(note.day, note); });
+  const remoteProjectKeys = new Set(remote.projects.map((project) => `${project.title.trim().toLowerCase()}|${project.link.trim().toLowerCase()}`));
+  const mergedProjects = [...remote.projects, ...local.projects.filter((project) => !remoteProjectKeys.has(`${project.title.trim().toLowerCase()}|${project.link.trim().toLowerCase()}`))];
+  return {
+    nickname: remote.nickname.trim() || local.nickname.trim(),
+    completed: [...new Set([...remote.completed, ...local.completed])].sort((a, b) => a - b),
+    notes: [...mergedNotes.values()].sort((a, b) => a.day - b.day),
+    projects: mergedProjects,
+  };
+}
+
+function isUuid(value: string) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: string) {
+  return Promise.race([promise, new Promise<T>((_, reject) => window.setTimeout(() => reject(new Error(message)), milliseconds))]);
+}
+
+async function loadRemoteData(userId: string): Promise<PawgressUserData> {
+  if (!supabase) throw new Error('Supabase is not configured');
+  const [profileResult, progressResult, notesResult, projectsResult] = await Promise.all([
+    supabase.from('profiles').select('nickname').eq('id', userId).maybeSingle(),
+    supabase.from('mission_progress').select('day').eq('user_id', userId).order('day'),
+    supabase.from('field_notes').select('id, day, content, created_at, updated_at').eq('user_id', userId).order('day'),
+    supabase.from('projects').select('id, title, description, link, category, status').eq('user_id', userId).order('created_at', { ascending: false }),
+  ]);
+  const firstError = [profileResult.error, progressResult.error, notesResult.error, projectsResult.error].find(Boolean);
+  if (firstError) throw new Error(firstError.message);
+  return {
+    nickname: (profileResult.data as { nickname?: string } | null)?.nickname ?? '',
+    completed: ((progressResult.data ?? []) as Array<{ day: number }>).map((row) => row.day),
+    notes: ((notesResult.data ?? []) as Array<{ id: string; day: number; content: string; created_at: string; updated_at: string }>).map((row) => ({ id: row.id, day: row.day, content: row.content, createdAt: row.created_at, updatedAt: row.updated_at })),
+    projects: (projectsResult.data ?? []) as Project[],
+  };
+}
+
+async function syncRemoteData(userId: string, data: PawgressUserData) {
+  if (!supabase) throw new Error('Supabase is not configured');
+  const profileResult = await supabase.from('profiles').upsert({ id: userId, nickname: data.nickname.trim().slice(0, 24) });
+  if (profileResult.error) throw new Error(profileResult.error.message);
+  if (data.completed.length) {
+    const progressResult = await supabase.from('mission_progress').upsert(data.completed.map((day) => ({ user_id: userId, day })), { onConflict: 'user_id,day' });
+    if (progressResult.error) throw new Error(progressResult.error.message);
+  }
+  if (data.notes.length) {
+    const notesResult = await supabase.from('field_notes').upsert(data.notes.map((note) => ({ user_id: userId, day: note.day, content: note.content.trim() })), { onConflict: 'user_id,day' });
+    if (notesResult.error) throw new Error(notesResult.error.message);
+  }
+  if (data.projects.length) {
+    const projectsResult = await supabase.from('projects').upsert(data.projects.map((project) => ({ ...(isUuid(project.id) ? { id: project.id } : {}), user_id: userId, title: project.title, description: project.description, link: project.link, category: project.category, status: project.status })));
+    if (projectsResult.error) throw new Error(projectsResult.error.message);
   }
 }
 
@@ -223,14 +294,19 @@ function useAeroMusic() {
 
 function App() {
   const [activeView, setActiveView] = useState<View>('today');
-  const [completed, setCompleted] = useState<number[]>(() => readStorage(STORAGE_COMPLETED, []));
-  const [notes, setNotes] = useState<Record<number, string>>(() => readStorage(STORAGE_NOTES, {}));
-  const [projects, setProjects] = useState<Project[]>(() => readStorage(STORAGE_PROJECTS, []));
-  const [displayName, setDisplayName] = useState(() => readStorage(STORAGE_NAME, ''));
-  const [nameDraft, setNameDraft] = useState(() => readStorage(STORAGE_NAME, ''));
-  const [nameEditorOpen, setNameEditorOpen] = useState(() => !readStorage(STORAGE_NAME, '').trim());
-  const [account, setAccount] = useState<AccountState>({ loading: true, authenticated: false });
-  const [syncReady, setSyncReady] = useState(false);
+  const [initialGuestData] = useState<PawgressUserData>(() => readLocalData(GUEST_SCOPE));
+  const [completed, setCompleted] = useState<number[]>(initialGuestData.completed);
+  const [notes, setNotes] = useState<FieldNote[]>(initialGuestData.notes);
+  const [projects, setProjects] = useState<Project[]>(initialGuestData.projects);
+  const [displayName, setDisplayName] = useState(initialGuestData.nickname);
+  const [nameDraft, setNameDraft] = useState(initialGuestData.nickname);
+  const [nameEditorOpen, setNameEditorOpen] = useState(() => !initialGuestData.nickname.trim());
+  const [account, setAccount] = useState<AccountState>({ loading: false, authenticated: false });
+  const [syncReady, setSyncReady] = useState(true);
+  const [profileHydrated, setProfileHydrated] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
   const [reflection, setReflection] = useState('');
   const [showReflection, setShowReflection] = useState(false);
   const [previewDay, setPreviewDay] = useState(1);
@@ -239,6 +315,7 @@ function App() {
   const [celebration, setCelebration] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const hydratedSessionRef = useRef<string | null | undefined>(undefined);
   const sounds = useAeroSounds();
   const music = useAeroMusic();
 
@@ -250,75 +327,133 @@ function App() {
   const completionPercent = Math.round((completed.length / MISSIONS.length) * 100);
   const unlockedCount = Math.min(MISSIONS.length, currentDay);
   const streak = completed.length;
+  const workspaceName = account.authenticated ? displayName : (displayName || readStorage(scopedStorageKey(STORAGE_NAME, GUEST_SCOPE), ''));
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_COMPLETED, JSON.stringify(completed));
-  }, [completed]);
+    window.localStorage.setItem(scopedStorageKey(STORAGE_COMPLETED, account.userId ?? GUEST_SCOPE), JSON.stringify(completed));
+  }, [account.userId, completed]);
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_NOTES, JSON.stringify(notes));
-  }, [notes]);
+    const legacyNotes = Object.fromEntries(notes.map((note) => [note.day, note.content]));
+    window.localStorage.setItem(scopedStorageKey(STORAGE_NOTES, account.userId ?? GUEST_SCOPE), JSON.stringify(legacyNotes));
+  }, [account.userId, notes]);
 
   useEffect(() => {
-    window.localStorage.setItem(STORAGE_PROJECTS, JSON.stringify(projects));
-  }, [projects]);
+    window.localStorage.setItem(scopedStorageKey(STORAGE_PROJECTS, account.userId ?? GUEST_SCOPE), JSON.stringify(projects));
+  }, [account.userId, projects]);
 
   useEffect(() => {
-    if (displayName.trim()) window.localStorage.setItem(STORAGE_NAME, displayName);
-  }, [displayName]);
+    if (!displayName.trim()) return;
+    window.localStorage.setItem(scopedStorageKey(STORAGE_NAME, account.userId ?? GUEST_SCOPE), JSON.stringify(displayName));
+    if (!account.authenticated) window.localStorage.setItem(STORAGE_NAME, JSON.stringify(displayName));
+  }, [account.userId, displayName]);
 
   useEffect(() => {
     let active = true;
-    fetch('/api/auth/session', { credentials: 'include' })
-      .then(async (response) => response.json() as Promise<{ authenticated?: boolean; user?: { openId?: string; email?: string }; profile?: RemoteProfile | null; hasProfile?: boolean }>)
-      .then((data) => {
-        if (!active) return;
-        if (!data.authenticated || !data.user?.openId) {
-          setAccount({ loading: false, authenticated: false });
-          setSyncReady(true);
-          return;
-        }
-        const previousAccountId = readStorage(STORAGE_ACCOUNT_ID, '');
-        const isNewBrowserAccount = Boolean(previousAccountId && previousAccountId !== data.user.openId);
-        setAccount({ loading: false, authenticated: true, userId: data.user.openId, email: data.user.email });
-        window.localStorage.setItem(STORAGE_ACCOUNT_ID, data.user.openId);
-        if (data.profile) {
-          setDisplayName(data.profile.nickname);
-          setNameDraft(data.profile.nickname);
-          setCompleted(data.profile.completed);
-          setNotes(data.profile.notes);
-          setProjects(data.profile.projects);
-          setNameEditorOpen(!data.profile.nickname.trim());
-        } else if (isNewBrowserAccount) {
-          setDisplayName('');
-          setNameDraft('');
-          setCompleted([]);
-          setNotes({});
-          setProjects([]);
-          setNameEditorOpen(true);
-        }
-        setSyncReady(true);
-      })
-      .catch(() => {
-        if (!active) return;
+    const applySession = async (session: { user: { id: string; email?: string | null } } | null) => {
+      const sessionKey = session?.user.id ?? null;
+      if (hydratedSessionRef.current === sessionKey) return;
+      hydratedSessionRef.current = sessionKey;
+      if (!active) return;
+      setAccount({ loading: true, authenticated: Boolean(session), userId: session?.user.id, email: session?.user.email ?? undefined });
+      setSyncError('');
+      if (!session) {
+        const guest = readLocalData(GUEST_SCOPE);
         setAccount({ loading: false, authenticated: false });
+        setDisplayName(guest.nickname);
+        setNameDraft(guest.nickname);
+        setCompleted(guest.completed);
+        setNotes(guest.notes);
+        setProjects(guest.projects);
+        setNameEditorOpen(!guest.nickname.trim());
+        setProfileHydrated(true);
         setSyncReady(true);
+        return;
+      }
+      try {
+        const remote = await withTimeout(loadRemoteData(session.user.id), 7000, 'Supabase data request timed out. Apply the Pawgress migration and check the project URL.');
+        const merged = mergeUserData(remote, readLocalData(GUEST_SCOPE));
+        if (!active) return;
+        window.localStorage.setItem(STORAGE_ACCOUNT_ID, session.user.id);
+        setAccount({ loading: false, authenticated: true, userId: session.user.id, email: session.user.email ?? undefined });
+        setDisplayName(merged.nickname);
+        setNameDraft(merged.nickname);
+        setCompleted(merged.completed);
+        setNotes(merged.notes);
+        setProjects(merged.projects);
+        setNameEditorOpen(!merged.nickname.trim());
+        setProfileHydrated(true);
+        setSyncReady(true);
+        void syncRemoteData(session.user.id, merged).catch((error: unknown) => setSyncError(error instanceof Error ? error.message : 'Unable to migrate local progress'));
+      } catch (error) {
+        if (!active) return;
+        const accountLocal = readLocalData(session.user.id);
+        setAccount({ loading: false, authenticated: true, userId: session.user.id, email: session.user.email ?? undefined });
+        setDisplayName(accountLocal.nickname);
+        setNameDraft(accountLocal.nickname);
+        setCompleted(accountLocal.completed);
+        setNotes(accountLocal.notes);
+        setProjects(accountLocal.projects);
+        setNameEditorOpen(!accountLocal.nickname.trim());
+        setProfileHydrated(true);
+        setSyncReady(false);
+        setSyncError(error instanceof Error ? error.message : 'Supabase data could not be loaded. Apply the Pawgress migration first.');
+      }
+    };
+    if (!supabase) {
+      setAccount({ loading: false, authenticated: false });
+      setProfileHydrated(true);
+      setSyncReady(true);
+      setSyncError('Supabase is not configured for this environment.');
+      return () => { active = false; };
+    }
+    const sessionTimeout = window.setTimeout(() => {
+      if (hydratedSessionRef.current === undefined) {
+        setSyncError('Supabase session check timed out; you can continue locally and retry sign-in.');
+        void applySession(null);
+      }
+    }, 5000);
+    let authListener: { subscription: { unsubscribe: () => void } } | null = null;
+    try {
+      const registration = supabase.auth.onAuthStateChange((_event, session) => {
+        window.setTimeout(() => void applySession(session ? { user: { id: session.user.id, email: session.user.email } } : null), 0);
       });
-    return () => { active = false; };
+      authListener = registration.data;
+      void supabase.auth.getSession().then(({ data, error }) => {
+        if (error) setSyncError(error.message);
+        void applySession(data.session ? { user: { id: data.session.user.id, email: data.session.user.email } } : null);
+      }).catch((error: unknown) => {
+        if (!active) return;
+        setSyncError(error instanceof Error ? error.message : 'Supabase session could not be loaded');
+        void applySession(null);
+      });
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : 'Supabase Auth could not start');
+      void applySession(null);
+    }
+    return () => { active = false; window.clearTimeout(sessionTimeout); authListener?.subscription.unsubscribe(); };
   }, []);
 
   useEffect(() => {
-    if (!syncReady || !account.authenticated) return;
+    if (!syncReady || !profileHydrated || !account.authenticated || !account.userId) return;
     const timer = window.setTimeout(() => {
-      void fetch('/api/profile', {
-        method: 'PUT',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nickname: displayName, completed, notes, projects }),
-      });
+      setSyncing(true);
+      void syncRemoteData(account.userId!, { nickname: displayName, completed, notes, projects })
+        .then(() => setSyncError(''))
+        .catch((error: unknown) => setSyncError(error instanceof Error ? error.message : 'Unable to sync progress'))
+        .finally(() => setSyncing(false));
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [account.authenticated, completed, displayName, notes, projects, syncReady]);
+  }, [account.authenticated, account.userId, completed, displayName, notes, profileHydrated, projects, syncReady]);
+
+  useEffect(() => {
+    if (account.authenticated || displayName.trim()) return;
+    const guest = readLocalData(GUEST_SCOPE);
+    if (!guest.nickname.trim()) return;
+    setDisplayName(guest.nickname);
+    setNameDraft(guest.nickname);
+    setNameEditorOpen(false);
+  }, [account.authenticated, displayName]);
 
   useEffect(() => {
     setPreviewDay(currentDay);
@@ -329,12 +464,39 @@ function App() {
     window.setTimeout(() => setToast(''), 2800);
   };
 
+  const upsertFieldNote = (day: number, content: string) => {
+    const now = new Date().toISOString();
+    setNotes((previous) => {
+      const existing = previous.find((note) => note.day === day);
+      const nextNote: FieldNote = { id: existing?.id ?? `local-note-${day}`, day, content, createdAt: existing?.createdAt ?? now, updatedAt: now };
+      return existing ? previous.map((note) => note.day === day ? nextNote : note) : [...previous, nextNote].sort((a, b) => a.day - b.day);
+    });
+  };
+
+  const saveFieldNote = (day: number, content: string, notify = true) => {
+    const normalized = content.trim().slice(0, 4000);
+    if (!normalized) {
+      showToast('Write a sentence before saving your field note');
+      return false;
+    }
+    upsertFieldNote(day, normalized);
+    if (notify) showToast(`Field note for Day ${padDay(day)} saved`);
+    return true;
+  };
+
+  const deleteFieldNote = async (note: FieldNote) => {
+    setNotes((previous) => previous.filter((item) => item.id !== note.id));
+    if (account.authenticated && account.userId && supabase && isUuid(note.id)) {
+      const { error } = await supabase.from('field_notes').delete().eq('id', note.id).eq('user_id', account.userId);
+      if (error) setSyncError(error.message);
+    }
+    showToast('Field note removed');
+  };
+
   const completeCurrentDay = () => {
     if (allComplete || completedSet.has(currentDay)) return;
     setCompleted((previous: number[]) => [...previous, currentDay]);
-    if (reflection.trim()) {
-      setNotes((previous: Record<number, string>) => ({ ...previous, [currentDay]: reflection.trim() }));
-    }
+    if (reflection.trim()) saveFieldNote(currentDay, reflection, false);
     setReflection('');
     setShowReflection(false);
     setCelebration(true);
@@ -359,14 +521,14 @@ function App() {
 
   const addProject = (draft: Omit<Project, 'id'>) => {
     const normalizedLink = /^https?:\/\//i.test(draft.link) ? draft.link : `https://${draft.link}`;
-    setProjects((previous) => [{ ...draft, id: `project-${Date.now()}`, link: normalizedLink }, ...previous]);
+    setProjects((previous) => [{ ...draft, id: clientId(), link: normalizedLink }, ...previous]);
     sounds.playSuccess();
     showToast('Project pinned to your workspace');
   };
 
   const saveDisplayName = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const nextName = nameDraft.trim().slice(0, 24);
+    const nextName = (nameDraft.trim() || workspaceName.trim()).slice(0, 24);
     if (!nextName) return;
     setDisplayName(nextName);
     setNameDraft(nextName);
@@ -375,8 +537,35 @@ function App() {
     showToast(`Welcome, ${nextName}`);
   };
 
-  const beginLogin = () => {
-    window.location.href = '/api/auth/login';
+  const beginLogin = async () => {
+    if (!supabase) {
+      setSyncError('Supabase is not configured for this environment.');
+      return;
+    }
+    setAuthBusy(true);
+    const { error } = await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: supabaseRedirectUrl() } });
+    if (error) {
+      setAuthBusy(false);
+      setSyncError(error.message);
+    }
+  };
+
+  const signOut = async () => {
+    setAuthBusy(true);
+    if (supabase) await supabase.auth.signOut();
+    const guest = readLocalData(GUEST_SCOPE);
+    hydratedSessionRef.current = undefined;
+    setAccount({ loading: false, authenticated: false });
+    setCompleted(guest.completed);
+    setNotes(guest.notes);
+    setProjects(guest.projects);
+    setDisplayName(guest.nickname);
+    setNameDraft(guest.nickname);
+    setNameEditorOpen(!guest.nickname.trim());
+    setProfileHydrated(true);
+    setSyncReady(true);
+    setAuthBusy(false);
+    showToast('Signed out — guest progress is still here on this device');
   };
 
   const inspectDay = (day: number) => {
@@ -446,12 +635,13 @@ function App() {
             <div className="streak-pill"><Flame size={15} fill="currentColor" /><span>{streak} day streak</span></div>
             <button className="icon-button sound-button" aria-label={sounds.enabled ? 'Mute Aero sounds' : 'Enable Aero startup chime and sounds'} aria-pressed={sounds.enabled} title={sounds.enabled ? 'Mute Aero sounds' : 'Enable Aero startup chime and sounds'} onClick={sounds.toggle}>{sounds.enabled ? <Volume2 size={17} /> : <VolumeX size={17} />}</button>
             <button className="icon-button help-button" aria-label="Help"><CircleHelp size={18} /></button>
-            {account.loading ? <span className="sync-status"><Globe2 size={12} /> connecting</span> : account.authenticated ? <span className="sync-status is-synced"><Globe2 size={12} /> synced</span> : <button className="sync-button" onClick={beginLogin}><Globe2 size={13} /> Sign in to sync</button>}
-            <button className="mini-profile" onClick={() => { setNameDraft(displayName); setNameEditorOpen(true); }} aria-label="Edit your name"><span className="mini-avatar"><PawMascot compact /></span><span className="mini-name">{displayName || 'Name me'}</span><ChevronRight size={14} /></button>
+            {account.loading || authBusy ? <span className="sync-status"><Globe2 size={12} /> connecting</span> : account.authenticated ? <><span className={`sync-status ${syncing ? '' : 'is-synced'}`}><Globe2 size={12} /> {syncing ? 'saving' : 'synced'}</span><button className="sync-button" onClick={() => void signOut()}>Sign out</button></> : <button className="sync-button" onClick={() => void beginLogin()}><Globe2 size={13} /> Continue with Google</button>}
+            <button className="mini-profile" onClick={() => { setNameDraft(workspaceName); setNameEditorOpen(true); }} aria-label="Edit your nickname"><span className="mini-avatar"><PawMascot compact /></span><span className="mini-name">{workspaceName || 'Choose a nickname'}</span><ChevronRight size={14} /></button>
           </div>
         </header>
 
         <div className="content-scroll">
+          {syncError && <div className="sync-error" role="alert"><CircleHelp size={15} /><span>{syncError}</span></div>}
           <AmbientAvatarWorld currentDay={currentDay} completionPercent={completionPercent} />
           {activeView === 'today' && (
             <TodayView
@@ -472,6 +662,7 @@ function App() {
               previewDay={previewDay}
               allComplete={allComplete}
               notes={notes}
+              onSaveNote={saveFieldNote}
             />
           )}
           {activeView === 'month' && (
@@ -481,7 +672,7 @@ function App() {
             <ProjectsView projects={projects} onAddProject={addProject} />
           )}
           {activeView === 'vault' && (
-            <VaultView currentDay={currentDay} completed={completedSet} onSelect={setSelectedResource} />
+            <VaultView currentDay={currentDay} completed={completedSet} notes={notes} onSelect={setSelectedResource} onSaveNote={saveFieldNote} onDeleteNote={deleteFieldNote} />
           )}
           {activeView === 'progress' && (
             <ProgressView completed={completedSet} completionPercent={completionPercent} currentDay={currentDay} streak={streak} notes={notes} onNavigate={navigate} />
@@ -496,11 +687,12 @@ function App() {
           <form className="name-dialog glass-panel" onSubmit={saveDisplayName}>
             <div className="dialog-orb"><PawMascot compact /></div>
             <span className="eyebrow"><Sparkles size={12} /> YOUR LITTLE WORKSPACE</span>
-            <h2>{displayName ? 'Update your name' : 'What should we call you?'}</h2>
-            <p>Give your DSA workspace a name so each small step feels like yours.</p>
-            <label htmlFor="display-name">Your name</label>
-            <input id="display-name" value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} placeholder="e.g. Alex, Nova, Sam..." maxLength={24} autoFocus />
+            <h2>{workspaceName ? 'Update your nickname' : 'What should we call you?'}</h2>
+            <p>Choose a nickname for your private DSA workspace so each small step feels like yours.</p>
+            <label htmlFor="display-name">Your nickname</label>
+            <input id="display-name" value={nameDraft || workspaceName} onChange={(event) => setNameDraft(event.target.value)} placeholder="e.g. Alex, Nova, Sam..." maxLength={24} autoFocus />
             <button className="primary-button" type="submit" disabled={!nameDraft.trim()}>Start working <ArrowRight size={14} /></button>
+            {account.authenticated && <button className="quiet-button dialog-signout" type="button" onClick={() => { setNameEditorOpen(false); void signOut(); }}>Sign out of this workspace</button>}
           </form>
         </div>
       )}
@@ -556,6 +748,7 @@ function TodayView({
   previewDay,
   allComplete,
   notes,
+  onSaveNote,
 }: {
   currentMission: Mission;
   currentDay: number;
@@ -573,7 +766,8 @@ function TodayView({
   previewMission: Mission;
   previewDay: number;
   allComplete: boolean;
-  notes: Record<number, string>;
+  notes: FieldNote[];
+  onSaveNote: (day: number, content: string) => boolean;
 }) {
   const activePreview = previewDay !== currentDay ? previewMission : currentMission;
   return <div className="view-stack">
@@ -592,7 +786,7 @@ function TodayView({
       <StatCard icon={<Target size={18} />} label="Current focus" value={`Day ${padDay(currentDay)}`} detail={currentMission.category} accent="rose" />
       <StatCard icon={<Flame size={18} />} label="Soft streak" value={`${streak} ${streak === 1 ? 'day' : 'days'}`} detail="Keep the thread warm" accent="aqua" />
       <StatCard icon={<BookOpen size={18} />} label="Arc progress" value={`${completionPercent}%`} detail={`${completed.size} of 30 complete`} accent="mint" />
-      <StatCard icon={<Sparkles size={18} />} label="Saved notes" value={`${Object.keys(notes).length}`} detail="Ideas worth reopening" accent="violet" />
+      <StatCard icon={<Sparkles size={18} />} label="Saved notes" value={`${notes.length}`} detail="Ideas worth reopening" accent="violet" />
     </section>
 
     <section className="dashboard-grid">
@@ -603,7 +797,7 @@ function TodayView({
         <div className="mission-lens"><span className="lens-icon"><LightbulbIcon /></span><div><span className="lens-label">The lens</span><p>{activePreview.takeaway}</p></div></div>
         {activePreview.day === currentDay && !allComplete ? <>
           <div className="mission-prompt"><span className="prompt-kicker">FIELD NOTE / {padDay(currentDay)}</span><p>{activePreview.prompt}</p></div>
-          {showReflection && <textarea value={reflection} onChange={(event) => setReflection(event.target.value)} placeholder="A sentence is enough. What did this shift for you?" rows={3} aria-label="Add a field note" />}
+          {showReflection && <><textarea value={reflection} onChange={(event) => setReflection(event.target.value)} placeholder="A sentence is enough. What did this shift for you?" rows={3} aria-label="Add a field note" /><div className="note-save-row"><button className="quiet-button" type="button" onClick={() => onSaveNote(currentDay, reflection)}><Bookmark size={14} /> Save field note</button>{notes.some((note) => note.day === currentDay) && <span className="saved-note-label"><Check size={12} /> saved locally and to your workspace</span>}</div></>}
           <div className="mission-footer"><button className="complete-button" onClick={onComplete}><span className="complete-check"><Check size={14} /></span> Complete this day <ArrowRight size={15} /></button><button className="reflection-button" onClick={() => setShowReflection(!showReflection)}>{showReflection ? 'Hide note' : 'Add a field note'} <Bookmark size={14} /></button></div>
         </> : <div className="review-banner"><Check size={16} /><span>{completed.has(activePreview.day) ? 'You have already completed this focus. Reopen it whenever you want.' : 'Finish your current focus to unlock this mission.'}</span></div>}
       </article>
@@ -658,19 +852,33 @@ function MonthView({ currentDay, completed, completionPercent, onInspectDay, onN
   </div>;
 }
 
-function VaultView({ currentDay, completed, onSelect }: { currentDay: number; completed: Set<number>; onSelect: (item: VaultItem) => void }) {
+function VaultView({ currentDay, completed, notes, onSelect, onSaveNote, onDeleteNote }: { currentDay: number; completed: Set<number>; notes: FieldNote[]; onSelect: (item: VaultItem) => void; onSaveNote: (day: number, content: string) => boolean; onDeleteNote: (note: FieldNote) => void }) {
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<'all' | 'core' | 'field'>('all');
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingNote, setEditingNote] = useState<FieldNote | null>(null);
+  const [editorDay, setEditorDay] = useState(currentDay);
+  const [draft, setDraft] = useState('');
   const unlockedItems = VAULT_ITEMS.filter((item) => item.day <= currentDay);
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleItems = filter === 'field' ? [] : unlockedItems.filter((item) => `${item.kind} ${item.title} ${item.excerpt}`.toLowerCase().includes(normalizedQuery));
+  const visibleNotes = filter === 'core' ? [] : notes.filter((note) => `field note day ${note.day} ${note.content}`.toLowerCase().includes(normalizedQuery));
+  const openNewNote = () => { setEditingNote(null); setEditorDay(currentDay); setDraft(''); setEditorOpen(true); };
+  const openEditNote = (note: FieldNote) => { setEditingNote(note); setEditorDay(note.day); setDraft(note.content); setEditorOpen(true); };
+  const submitNote = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (onSaveNote(editorDay, draft)) { setEditorOpen(false); setDraft(''); } };
   return <div className="view-stack"><PageIntro eyebrow="Your idea shelf" title="Knowledge, with a place to land." description="Every completed mission leaves a little more light behind. Reopen a lens, add a note, or follow the thread back to the day it came from." action={<div className="vault-count"><LibraryBig size={16} /><span><strong>{unlockedItems.length}</strong> unlocked resources</span></div>} />
-    <div className="vault-toolbar glass-panel"><div className="search-field"><Search size={16} /><input placeholder="Search your vault" aria-label="Search your vault" /></div><div className="vault-filters"><button className="filter-chip is-active">All notes</button><button className="filter-chip">Core concepts</button><button className="filter-chip">Field notes</button></div></div>
-    <section className="vault-grid">{VAULT_ITEMS.map((item) => { const unlocked = item.day <= currentDay; const isComplete = completed.has(item.day); return <button key={item.title} className={`vault-card glass-panel ${unlocked ? 'is-unlocked' : 'is-locked'}`} onClick={() => unlocked && onSelect(item)}><div className={`vault-card-icon ${unlocked ? 'unlocked' : ''}`}>{unlocked ? <Bookmark size={18} /> : <Lock size={17} />}</div><div className="vault-card-copy"><div className="vault-card-meta"><span>{item.kind}</span><i /> <span>Day {padDay(item.day)}</span></div><h3>{item.title}</h3><p>{unlocked ? item.excerpt : 'Complete the mission to reveal this resource.'}</p></div><div className="vault-card-footer"><span>{unlocked ? item.duration : 'Locked'}</span>{isComplete && <span className="saved-mark"><Check size={12} /> explored</span>}<ChevronRight size={15} /></div></button>; })}</section>
+    <div className="vault-toolbar glass-panel"><div className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your vault" aria-label="Search your vault" /></div><div className="vault-filters" role="group" aria-label="Vault filters"><button className={`filter-chip ${filter === 'all' ? 'is-active' : ''}`} aria-pressed={filter === 'all'} onClick={() => setFilter('all')}>All notes</button><button className={`filter-chip ${filter === 'core' ? 'is-active' : ''}`} aria-pressed={filter === 'core'} onClick={() => setFilter('core')}>Core concepts</button><button className={`filter-chip ${filter === 'field' ? 'is-active' : ''}`} aria-pressed={filter === 'field'} onClick={() => setFilter('field')}>Field notes</button><button className="primary-button small" onClick={openNewNote}><Bookmark size={14} /> New field note</button></div></div>
+    {editorOpen && <form className="note-editor glass-panel" onSubmit={submitNote}><div><span className="section-label"><Bookmark size={13} /> {editingNote ? 'Edit field note' : 'Capture a field note'}</span><h3>{editingNote ? `Day ${padDay(editingNote.day)} note` : 'Give the thought a place to land.'}</h3></div><label>Mission day<select value={editorDay} onChange={(event) => setEditorDay(Number(event.target.value))}>{Array.from({ length: currentDay }, (_, index) => index + 1).map((day) => <option key={day} value={day}>Day {padDay(day)} — {MISSIONS[day - 1].title}</option>)}</select></label><label>Your note<textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="What shifted, clicked, or deserves another look?" maxLength={4000} rows={4} autoFocus /></label><div className="note-editor-actions"><button className="quiet-button" type="button" onClick={() => setEditorOpen(false)}>Cancel</button><button className="primary-button small" type="submit"><Check size={14} /> Save field note</button></div></form>}
+    <section className="vault-grid">{visibleItems.map((item) => { const isComplete = completed.has(item.day); return <button key={item.title} className="vault-card glass-panel is-unlocked" onClick={() => onSelect(item)}><div className="vault-card-icon unlocked"><Bookmark size={18} /></div><div className="vault-card-copy"><div className="vault-card-meta"><span>{item.kind}</span><i /> <span>Day {padDay(item.day)}</span></div><h3>{item.title}</h3><p>{item.excerpt}</p></div><div className="vault-card-footer"><span>{item.duration}</span>{isComplete && <span className="saved-mark"><Check size={12} /> explored</span>}<ChevronRight size={15} /></div></button>; })}{visibleNotes.map((note) => <article key={note.id} className="vault-card glass-panel is-unlocked field-note-card"><div className="vault-card-icon unlocked"><Bookmark size={18} /></div><div className="vault-card-copy"><div className="vault-card-meta"><span>Field note</span><i /> <span>Day {padDay(note.day)}</span></div><h3>{MISSIONS[note.day - 1]?.title ?? 'Mission note'}</h3><p>{note.content}</p></div><div className="vault-card-footer"><span>Saved</span><button className="note-card-action" onClick={() => openEditNote(note)} aria-label={`Edit Day ${note.day} field note`}>Edit</button><button className="note-card-action danger" onClick={() => onDeleteNote(note)} aria-label={`Delete Day ${note.day} field note`}>Delete</button></div></article>)}</section>
+    {!visibleItems.length && !visibleNotes.length && <section className="vault-note glass-panel"><div className="note-orbit"><Search size={23} /></div><div><span className="section-label">Nothing in this view yet</span><h3>{filter === 'field' ? 'Your first field note is waiting.' : 'Try a different search.'}</h3><p>{filter === 'field' ? 'Capture a thought from the current mission and it will stay with your workspace.' : 'Search by a concept, mission title, or note phrase.'}</p></div></section>}
     <section className="vault-note glass-panel"><div className="note-orbit"><Orbit size={23} /></div><div><span className="section-label">A small invitation</span><h3>Don’t just collect the note. Use it.</h3><p>When an idea reappears in a real decision, that is when it becomes part of your operating system.</p></div><Sparkles className="note-sparkle" size={20} /> </section>
   </div>;
 }
 
-function ProgressView({ completed, completionPercent, currentDay, streak, notes, onNavigate }: { completed: Set<number>; completionPercent: number; currentDay: number; streak: number; notes: Record<number, string>; onNavigate: (view: View) => void }) {
+function ProgressView({ completed, completionPercent, currentDay, streak, notes, onNavigate }: { completed: Set<number>; completionPercent: number; currentDay: number; streak: number; notes: FieldNote[]; onNavigate: (view: View) => void }) {
   const milestoneList = [{ day: 1, title: 'First light', detail: 'Begin the field guide', icon: <Sparkles size={17} /> }, { day: 7, title: 'Keep the thread', detail: 'One week of noticing', icon: <Flame size={17} /> }, { day: 15, title: 'Pattern finder', detail: 'Halfway through the arc', icon: <Orbit size={17} /> }, { day: 30, title: 'Field guide keeper', detail: 'Complete the month', icon: <Trophy size={17} /> }];
   return <div className="view-stack"><PageIntro eyebrow="Momentum, not pressure" title="Look how far the thread reaches." description="Progress is a conversation with your future self. Here is what your small returns are building." action={<button className="quiet-button" onClick={() => onNavigate('today')}><RotateCcw size={15} /> Return to today</button>} />
-    <section className="progress-hero glass-panel"><div className="progress-ring-wrap"><ProgressRing percent={completionPercent} size={188} /><div className="ring-center"><strong>{completionPercent}<small>%</small></strong><span>explored</span></div></div><div className="progress-hero-copy"><span className="section-label"><span className="label-spark">✦</span> Month One momentum</span><h2>{completed.size === 0 ? 'The first dot is the beginning of a constellation.' : completed.size < 7 ? 'You are building a very good kind of evidence.' : 'Your attention is beginning to compound.'}</h2><p>{completed.size === 0 ? 'Complete the first focus to give your arc a starting point.' : `${completed.size} focused ${completed.size === 1 ? 'day has' : 'days have'} been added to your field guide. Keep returning to the thread.`}</p><div className="progress-hero-stats"><div><strong>{streak}</strong><span>soft streak</span></div><div><strong>{Object.keys(notes).length}</strong><span>field notes</span></div><div><strong>{30 - completed.size}</strong><span>days to go</span></div></div></div><div className="progress-orbit-art"><PawMascot /><span className="orbit-art-star one">✦</span><span className="orbit-art-star two">✧</span></div></section>
+    <section className="progress-hero glass-panel"><div className="progress-ring-wrap"><ProgressRing percent={completionPercent} size={188} /><div className="ring-center"><strong>{completionPercent}<small>%</small></strong><span>explored</span></div></div><div className="progress-hero-copy"><span className="section-label"><span className="label-spark">✦</span> Month One momentum</span><h2>{completed.size === 0 ? 'The first dot is the beginning of a constellation.' : completed.size < 7 ? 'You are building a very good kind of evidence.' : 'Your attention is beginning to compound.'}</h2><p>{completed.size === 0 ? 'Complete the first focus to give your arc a starting point.' : `${completed.size} focused ${completed.size === 1 ? 'day has' : 'days have'} been added to your field guide. Keep returning to the thread.`}</p><div className="progress-hero-stats"><div><strong>{streak}</strong><span>soft streak</span></div><div><strong>{notes.length}</strong><span>field notes</span></div><div><strong>{30 - completed.size}</strong><span>days to go</span></div></div></div><div className="progress-orbit-art"><PawMascot /><span className="orbit-art-star one">✦</span><span className="orbit-art-star two">✧</span></div></section>
     <section className="milestones-section"><div className="section-header-row"><div><span className="section-label"><span className="label-spark">✦</span> Gentle milestones</span><h2>Little signals of becoming</h2></div><span className="milestone-subtitle">No badges to chase. Just doors opening.</span></div><div className="milestones-grid">{milestoneList.map((milestone) => { const unlocked = completed.has(milestone.day) || completed.size >= milestone.day; return <div key={milestone.day} className={`milestone-card glass-panel ${unlocked ? 'is-unlocked' : ''}`}><div className="milestone-icon">{unlocked ? <Check size={16} /> : milestone.icon}</div><div><span className="milestone-day">DAY {padDay(milestone.day)}</span><h3>{milestone.title}</h3><p>{milestone.detail}</p></div><span className="milestone-state">{unlocked ? 'unlocked' : 'waiting'}</span></div>; })}</div></section>
     <section className="progress-detail-grid"><article className="activity-card glass-panel"><div className="card-topline"><span className="section-label"><span className="label-spark">✦</span> Your rhythm</span><span className="date-note">Last 30 days</span></div><div className="activity-bars">{Array.from({ length: 30 }, (_, index) => { const day = index + 1; const done = completed.has(day); return <span key={day} className={done ? 'is-done' : day === currentDay ? 'is-current' : ''} title={`Day ${day}`} />; })}</div><div className="activity-caption"><span><i className="legend-dot done" /> {completed.size} explored</span><span><i className="legend-dot current" /> next open door</span></div></article><article className="progress-note glass-panel"><div className="note-orbit"><PawPrint size={20} /></div><div><span className="section-label">Orbit’s reminder</span><h3>“A day completed is not a day judged.”</h3><p>The only thing this arc asks is that you keep a gentle relationship with your own attention.</p></div></article></section>
   </div>;
