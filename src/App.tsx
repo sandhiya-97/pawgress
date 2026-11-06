@@ -36,7 +36,6 @@ import {
   X,
   Zap,
 } from 'lucide-react';
-import { supabase, supabaseRedirectUrl } from './lib/supabase';
 import type { FieldNote, PawgressUserData, Project } from './types';
 
 type View = 'today' | 'month' | 'projects' | 'vault' | 'progress';
@@ -61,12 +60,7 @@ type VaultItem = {
   duration: string;
 };
 
-type AccountState = {
-  loading: boolean;
-  authenticated: boolean;
-  userId?: string;
-  email?: string;
-};
+
 
 const MISSIONS: Mission[] = [
   { day: 1, title: 'Big O Notation & Time/Space Complexity', category: 'Arrays & fundamentals', time: '25 min', overview: 'Learn to read the cost of an algorithm before you run it, using time and space complexity as your first problem-solving lens.', prompt: 'Take one familiar loop and describe its time and space complexity in Big O.', takeaway: 'Big O is a map of how an algorithm scales as the input grows.', color: 'rose' },
@@ -123,7 +117,7 @@ const STORAGE_COMPLETED = 'pawgress-month-one-dsa-completed';
 const STORAGE_NOTES = 'pawgress-month-one-dsa-notes';
 const STORAGE_PROJECTS = 'pawgress-projects';
 const STORAGE_NAME = 'pawgress-user-name';
-const STORAGE_ACCOUNT_ID = 'pawgress-account-id';
+const STORAGE_ACCOUNT_ID = 'pawgress-account-id'; // used once to migrate older account-scoped browser data
 const GUEST_SCOPE = 'guest';
 
 function readStorage<T>(key: string, fallback: T): T {
@@ -161,63 +155,6 @@ function readLocalData(scope: string): PawgressUserData {
 
 function notesByDay(notes: FieldNote[]) {
   return new Map(notes.map((note) => [note.day, note]));
-}
-
-function mergeUserData(remote: PawgressUserData, local: PawgressUserData): PawgressUserData {
-  const mergedNotes = notesByDay(remote.notes);
-  local.notes.forEach((note) => { if (!mergedNotes.has(note.day)) mergedNotes.set(note.day, note); });
-  const remoteProjectKeys = new Set(remote.projects.map((project) => `${project.title.trim().toLowerCase()}|${project.link.trim().toLowerCase()}`));
-  const mergedProjects = [...remote.projects, ...local.projects.filter((project) => !remoteProjectKeys.has(`${project.title.trim().toLowerCase()}|${project.link.trim().toLowerCase()}`))];
-  return {
-    nickname: remote.nickname.trim() || local.nickname.trim(),
-    completed: [...new Set([...remote.completed, ...local.completed])].sort((a, b) => a - b),
-    notes: [...mergedNotes.values()].sort((a, b) => a.day - b.day),
-    projects: mergedProjects,
-  };
-}
-
-function isUuid(value: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-}
-
-function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: string) {
-  return Promise.race([promise, new Promise<T>((_, reject) => window.setTimeout(() => reject(new Error(message)), milliseconds))]);
-}
-
-async function loadRemoteData(userId: string): Promise<PawgressUserData> {
-  if (!supabase) throw new Error('Supabase is not configured');
-  const [profileResult, progressResult, notesResult, projectsResult] = await Promise.all([
-    supabase.from('profiles').select('nickname').eq('id', userId).maybeSingle(),
-    supabase.from('mission_progress').select('day').eq('user_id', userId).order('day'),
-    supabase.from('field_notes').select('id, day, content, created_at, updated_at').eq('user_id', userId).order('day'),
-    supabase.from('projects').select('id, title, description, link, category, status').eq('user_id', userId).order('created_at', { ascending: false }),
-  ]);
-  const firstError = [profileResult.error, progressResult.error, notesResult.error, projectsResult.error].find(Boolean);
-  if (firstError) throw new Error(firstError.message);
-  return {
-    nickname: (profileResult.data as { nickname?: string } | null)?.nickname ?? '',
-    completed: ((progressResult.data ?? []) as Array<{ day: number }>).map((row) => row.day),
-    notes: ((notesResult.data ?? []) as Array<{ id: string; day: number; content: string; created_at: string; updated_at: string }>).map((row) => ({ id: row.id, day: row.day, content: row.content, createdAt: row.created_at, updatedAt: row.updated_at })),
-    projects: (projectsResult.data ?? []) as Project[],
-  };
-}
-
-async function syncRemoteData(userId: string, data: PawgressUserData) {
-  if (!supabase) throw new Error('Supabase is not configured');
-  const profileResult = await supabase.from('profiles').upsert({ id: userId, nickname: data.nickname.trim().slice(0, 24) });
-  if (profileResult.error) throw new Error(profileResult.error.message);
-  if (data.completed.length) {
-    const progressResult = await supabase.from('mission_progress').upsert(data.completed.map((day) => ({ user_id: userId, day })), { onConflict: 'user_id,day' });
-    if (progressResult.error) throw new Error(progressResult.error.message);
-  }
-  if (data.notes.length) {
-    const notesResult = await supabase.from('field_notes').upsert(data.notes.map((note) => ({ user_id: userId, day: note.day, content: note.content.trim() })), { onConflict: 'user_id,day' });
-    if (notesResult.error) throw new Error(notesResult.error.message);
-  }
-  if (data.projects.length) {
-    const projectsResult = await supabase.from('projects').upsert(data.projects.map((project) => ({ ...(isUuid(project.id) ? { id: project.id } : {}), user_id: userId, title: project.title, description: project.description, link: project.link, category: project.category, status: project.status })));
-    if (projectsResult.error) throw new Error(projectsResult.error.message);
-  }
 }
 
 function padDay(day: number) {
@@ -294,19 +231,30 @@ function useAeroMusic() {
 
 function App() {
   const [activeView, setActiveView] = useState<View>('today');
-  const [initialGuestData] = useState<PawgressUserData>(() => readLocalData(GUEST_SCOPE));
+  const [initialGuestData] = useState<PawgressUserData>(() => {
+    const guest = readLocalData(GUEST_SCOPE);
+    const previousAccountId = readStorage<string>(STORAGE_ACCOUNT_ID, '');
+    if (!previousAccountId) return guest;
+    const accountLocal = readLocalData(previousAccountId);
+    const migrated: PawgressUserData = {
+      nickname: guest.nickname || accountLocal.nickname,
+      completed: [...new Set([...guest.completed, ...accountLocal.completed])].sort((a, b) => a - b),
+      notes: [...new Map([...accountLocal.notes, ...guest.notes].map((note) => [note.day, note])).values()].sort((a, b) => a.day - b.day),
+      projects: [...accountLocal.projects, ...guest.projects.filter((item) => !accountLocal.projects.some((old) => old.id === item.id))],
+    };
+    window.localStorage.setItem(scopedStorageKey(STORAGE_COMPLETED, GUEST_SCOPE), JSON.stringify(migrated.completed));
+    window.localStorage.setItem(scopedStorageKey(STORAGE_NOTES, GUEST_SCOPE), JSON.stringify(Object.fromEntries(migrated.notes.map((note) => [note.day, note.content]))));
+    window.localStorage.setItem(scopedStorageKey(STORAGE_PROJECTS, GUEST_SCOPE), JSON.stringify(migrated.projects));
+    window.localStorage.setItem(scopedStorageKey(STORAGE_NAME, GUEST_SCOPE), JSON.stringify(migrated.nickname));
+    window.localStorage.removeItem(STORAGE_ACCOUNT_ID);
+    return migrated;
+  });
   const [completed, setCompleted] = useState<number[]>(initialGuestData.completed);
   const [notes, setNotes] = useState<FieldNote[]>(initialGuestData.notes);
   const [projects, setProjects] = useState<Project[]>(initialGuestData.projects);
   const [displayName, setDisplayName] = useState(initialGuestData.nickname);
   const [nameDraft, setNameDraft] = useState(initialGuestData.nickname);
   const [nameEditorOpen, setNameEditorOpen] = useState(() => !initialGuestData.nickname.trim());
-  const [account, setAccount] = useState<AccountState>({ loading: false, authenticated: false });
-  const [syncReady, setSyncReady] = useState(true);
-  const [profileHydrated, setProfileHydrated] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [syncError, setSyncError] = useState('');
-  const [authBusy, setAuthBusy] = useState(false);
   const [reflection, setReflection] = useState('');
   const [showReflection, setShowReflection] = useState(false);
   const [previewDay, setPreviewDay] = useState(1);
@@ -315,7 +263,6 @@ function App() {
   const [celebration, setCelebration] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const hydratedSessionRef = useRef<string | null | undefined>(undefined);
   const sounds = useAeroSounds();
   const music = useAeroMusic();
 
@@ -327,133 +274,32 @@ function App() {
   const completionPercent = Math.round((completed.length / MISSIONS.length) * 100);
   const unlockedCount = Math.min(MISSIONS.length, currentDay);
   const streak = completed.length;
-  const workspaceName = account.authenticated ? displayName : (displayName || readStorage(scopedStorageKey(STORAGE_NAME, GUEST_SCOPE), ''));
+  const workspaceName = displayName || readStorage(scopedStorageKey(STORAGE_NAME, GUEST_SCOPE), '');
 
   useEffect(() => {
-    window.localStorage.setItem(scopedStorageKey(STORAGE_COMPLETED, account.userId ?? GUEST_SCOPE), JSON.stringify(completed));
-  }, [account.userId, completed]);
+    window.localStorage.setItem(scopedStorageKey(STORAGE_COMPLETED, GUEST_SCOPE), JSON.stringify(completed));
+  }, [completed]);
 
   useEffect(() => {
     const legacyNotes = Object.fromEntries(notes.map((note) => [note.day, note.content]));
-    window.localStorage.setItem(scopedStorageKey(STORAGE_NOTES, account.userId ?? GUEST_SCOPE), JSON.stringify(legacyNotes));
-  }, [account.userId, notes]);
+    window.localStorage.setItem(scopedStorageKey(STORAGE_NOTES, GUEST_SCOPE), JSON.stringify(legacyNotes));
+  }, [notes]);
 
   useEffect(() => {
-    window.localStorage.setItem(scopedStorageKey(STORAGE_PROJECTS, account.userId ?? GUEST_SCOPE), JSON.stringify(projects));
-  }, [account.userId, projects]);
+    window.localStorage.setItem(scopedStorageKey(STORAGE_PROJECTS, GUEST_SCOPE), JSON.stringify(projects));
+  }, [projects]);
 
   useEffect(() => {
     if (!displayName.trim()) return;
-    window.localStorage.setItem(scopedStorageKey(STORAGE_NAME, account.userId ?? GUEST_SCOPE), JSON.stringify(displayName));
-    if (!account.authenticated) window.localStorage.setItem(STORAGE_NAME, JSON.stringify(displayName));
-  }, [account.userId, displayName]);
+    window.localStorage.setItem(scopedStorageKey(STORAGE_NAME, GUEST_SCOPE), JSON.stringify(displayName));
+    window.localStorage.setItem(STORAGE_NAME, JSON.stringify(displayName));
+  }, [displayName]);
 
   useEffect(() => {
-    let active = true;
-    const applySession = async (session: { user: { id: string; email?: string | null } } | null) => {
-      const sessionKey = session?.user.id ?? null;
-      if (hydratedSessionRef.current === sessionKey) return;
-      hydratedSessionRef.current = sessionKey;
-      if (!active) return;
-      setAccount({ loading: true, authenticated: Boolean(session), userId: session?.user.id, email: session?.user.email ?? undefined });
-      setSyncError('');
-      if (!session) {
-        const guest = readLocalData(GUEST_SCOPE);
-        setAccount({ loading: false, authenticated: false });
-        setDisplayName(guest.nickname);
-        setNameDraft(guest.nickname);
-        setCompleted(guest.completed);
-        setNotes(guest.notes);
-        setProjects(guest.projects);
-        setNameEditorOpen(!guest.nickname.trim());
-        setProfileHydrated(true);
-        setSyncReady(true);
-        return;
-      }
-      try {
-        const remote = await withTimeout(loadRemoteData(session.user.id), 7000, 'Supabase data request timed out. Apply the Pawgress migration and check the project URL.');
-        const merged = mergeUserData(remote, readLocalData(GUEST_SCOPE));
-        if (!active) return;
-        window.localStorage.setItem(STORAGE_ACCOUNT_ID, session.user.id);
-        setAccount({ loading: false, authenticated: true, userId: session.user.id, email: session.user.email ?? undefined });
-        setDisplayName(merged.nickname);
-        setNameDraft(merged.nickname);
-        setCompleted(merged.completed);
-        setNotes(merged.notes);
-        setProjects(merged.projects);
-        setNameEditorOpen(!merged.nickname.trim());
-        setProfileHydrated(true);
-        setSyncReady(true);
-        void syncRemoteData(session.user.id, merged).catch((error: unknown) => setSyncError(error instanceof Error ? error.message : 'Unable to migrate local progress'));
-      } catch (error) {
-        if (!active) return;
-        const accountLocal = readLocalData(session.user.id);
-        setAccount({ loading: false, authenticated: true, userId: session.user.id, email: session.user.email ?? undefined });
-        setDisplayName(accountLocal.nickname);
-        setNameDraft(accountLocal.nickname);
-        setCompleted(accountLocal.completed);
-        setNotes(accountLocal.notes);
-        setProjects(accountLocal.projects);
-        setNameEditorOpen(!accountLocal.nickname.trim());
-        setProfileHydrated(true);
-        setSyncReady(false);
-        setSyncError(error instanceof Error ? error.message : 'Supabase data could not be loaded. Apply the Pawgress migration first.');
-      }
-    };
-    if (!supabase) {
-      setAccount({ loading: false, authenticated: false });
-      setProfileHydrated(true);
-      setSyncReady(true);
-      setSyncError('Supabase is not configured for this environment.');
-      return () => { active = false; };
-    }
-    const sessionTimeout = window.setTimeout(() => {
-      if (hydratedSessionRef.current === undefined) {
-        setSyncError('Supabase session check timed out; you can continue locally and retry sign-in.');
-        void applySession(null);
-      }
-    }, 5000);
-    let authListener: { subscription: { unsubscribe: () => void } } | null = null;
-    try {
-      const registration = supabase.auth.onAuthStateChange((_event, session) => {
-        window.setTimeout(() => void applySession(session ? { user: { id: session.user.id, email: session.user.email } } : null), 0);
-      });
-      authListener = registration.data;
-      void supabase.auth.getSession().then(({ data, error }) => {
-        if (error) setSyncError(error.message);
-        void applySession(data.session ? { user: { id: data.session.user.id, email: data.session.user.email } } : null);
-      }).catch((error: unknown) => {
-        if (!active) return;
-        setSyncError(error instanceof Error ? error.message : 'Supabase session could not be loaded');
-        void applySession(null);
-      });
-    } catch (error) {
-      setSyncError(error instanceof Error ? error.message : 'Supabase Auth could not start');
-      void applySession(null);
-    }
-    return () => { active = false; window.clearTimeout(sessionTimeout); authListener?.subscription.unsubscribe(); };
-  }, []);
-
-  useEffect(() => {
-    if (!syncReady || !profileHydrated || !account.authenticated || !account.userId) return;
-    const timer = window.setTimeout(() => {
-      setSyncing(true);
-      void syncRemoteData(account.userId!, { nickname: displayName, completed, notes, projects })
-        .then(() => setSyncError(''))
-        .catch((error: unknown) => setSyncError(error instanceof Error ? error.message : 'Unable to sync progress'))
-        .finally(() => setSyncing(false));
-    }, 450);
-    return () => window.clearTimeout(timer);
-  }, [account.authenticated, account.userId, completed, displayName, notes, profileHydrated, projects, syncReady]);
-
-  useEffect(() => {
-    if (account.authenticated || displayName.trim()) return;
+    if (displayName.trim()) return;
     const guest = readLocalData(GUEST_SCOPE);
-    if (!guest.nickname.trim()) return;
-    setDisplayName(guest.nickname);
-    setNameDraft(guest.nickname);
-    setNameEditorOpen(false);
-  }, [account.authenticated, displayName]);
+    if (guest.nickname.trim()) { setDisplayName(guest.nickname); setNameDraft(guest.nickname); setNameEditorOpen(false); }
+  }, [displayName]);
 
   useEffect(() => {
     setPreviewDay(currentDay);
@@ -484,12 +330,8 @@ function App() {
     return true;
   };
 
-  const deleteFieldNote = async (note: FieldNote) => {
+  const deleteFieldNote = (note: FieldNote) => {
     setNotes((previous) => previous.filter((item) => item.id !== note.id));
-    if (account.authenticated && account.userId && supabase && isUuid(note.id)) {
-      const { error } = await supabase.from('field_notes').delete().eq('id', note.id).eq('user_id', account.userId);
-      if (error) setSyncError(error.message);
-    }
     showToast('Field note removed');
   };
 
@@ -537,37 +379,6 @@ function App() {
     showToast(`Welcome, ${nextName}`);
   };
 
-  const beginLogin = async () => {
-    if (!supabase) {
-      setSyncError('Supabase is not configured for this environment.');
-      return;
-    }
-    setAuthBusy(true);
-    const { error } = await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: supabaseRedirectUrl() } });
-    if (error) {
-      setAuthBusy(false);
-      setSyncError(error.message);
-    }
-  };
-
-  const signOut = async () => {
-    setAuthBusy(true);
-    if (supabase) await supabase.auth.signOut();
-    const guest = readLocalData(GUEST_SCOPE);
-    hydratedSessionRef.current = undefined;
-    setAccount({ loading: false, authenticated: false });
-    setCompleted(guest.completed);
-    setNotes(guest.notes);
-    setProjects(guest.projects);
-    setDisplayName(guest.nickname);
-    setNameDraft(guest.nickname);
-    setNameEditorOpen(!guest.nickname.trim());
-    setProfileHydrated(true);
-    setSyncReady(true);
-    setAuthBusy(false);
-    showToast('Signed out — guest progress is still here on this device');
-  };
-
   const inspectDay = (day: number) => {
     if (day <= currentDay || completedSet.has(day)) {
       setPreviewDay(day);
@@ -600,7 +411,7 @@ function App() {
 
         <div className="sidebar-profile glass-panel">
           <div className="avatar-orb"><PawMascot compact /></div>
-          <div className="profile-copy"><strong>{displayName || 'Curious mind'}</strong><span>{account.authenticated ? 'Synced workspace' : 'Local until you sign in'}</span></div>
+          <div className="profile-copy"><strong>{displayName || 'Curious mind'}</strong><span>Saved on this device</span></div>
           <span className="online-dot" aria-label="Active" />
         </div>
 
@@ -635,13 +446,11 @@ function App() {
             <div className="streak-pill"><Flame size={15} fill="currentColor" /><span>{streak} day streak</span></div>
             <button className="icon-button sound-button" aria-label={sounds.enabled ? 'Mute Aero sounds' : 'Enable Aero startup chime and sounds'} aria-pressed={sounds.enabled} title={sounds.enabled ? 'Mute Aero sounds' : 'Enable Aero startup chime and sounds'} onClick={sounds.toggle}>{sounds.enabled ? <Volume2 size={17} /> : <VolumeX size={17} />}</button>
             <button className="icon-button help-button" aria-label="Help"><CircleHelp size={18} /></button>
-            {account.loading || authBusy ? <span className="sync-status"><Globe2 size={12} /> connecting</span> : account.authenticated ? <><span className={`sync-status ${syncing ? '' : 'is-synced'}`}><Globe2 size={12} /> {syncing ? 'saving' : 'synced'}</span><button className="sync-button" onClick={() => void signOut()}>Sign out</button></> : <button className="sync-button" onClick={() => void beginLogin()}><Globe2 size={13} /> Continue with Google</button>}
             <button className="mini-profile" onClick={() => { setNameDraft(workspaceName); setNameEditorOpen(true); }} aria-label="Edit your nickname"><span className="mini-avatar"><PawMascot compact /></span><span className="mini-name">{workspaceName || 'Choose a nickname'}</span><ChevronRight size={14} /></button>
           </div>
         </header>
 
         <div className="content-scroll">
-          {syncError && <div className="sync-error" role="alert"><CircleHelp size={15} /><span>{syncError}</span></div>}
           <AmbientAvatarWorld currentDay={currentDay} completionPercent={completionPercent} />
           {activeView === 'today' && (
             <TodayView
@@ -692,7 +501,7 @@ function App() {
             <label htmlFor="display-name">Your nickname</label>
             <input id="display-name" value={nameDraft || workspaceName} onChange={(event) => setNameDraft(event.target.value)} placeholder="e.g. Alex, Nova, Sam..." maxLength={24} autoFocus />
             <button className="primary-button" type="submit" disabled={!nameDraft.trim()}>Start working <ArrowRight size={14} /></button>
-            {account.authenticated && <button className="quiet-button dialog-signout" type="button" onClick={() => { setNameEditorOpen(false); void signOut(); }}>Sign out of this workspace</button>}
+            <button className="quiet-button" type="button" onClick={() => { if (window.confirm('Clear all Pawgress progress, notes, projects and your nickname from this browser? This cannot be undone.')) { [STORAGE_COMPLETED, STORAGE_NOTES, STORAGE_PROJECTS, STORAGE_NAME, STORAGE_ACCOUNT_ID, 'pawgress-user-name'].forEach((key) => { window.localStorage.removeItem(key); window.localStorage.removeItem(scopedStorageKey(key, GUEST_SCOPE)); }); setCompleted([]); setNotes([]); setProjects([]); setDisplayName(''); setNameDraft(''); showToast('Your local Pawgress data has been cleared'); } }}>Clear all my local data</button>
           </form>
         </div>
       )}
@@ -797,7 +606,7 @@ function TodayView({
         <div className="mission-lens"><span className="lens-icon"><LightbulbIcon /></span><div><span className="lens-label">The lens</span><p>{activePreview.takeaway}</p></div></div>
         {activePreview.day === currentDay && !allComplete ? <>
           <div className="mission-prompt"><span className="prompt-kicker">FIELD NOTE / {padDay(currentDay)}</span><p>{activePreview.prompt}</p></div>
-          {showReflection && <><textarea value={reflection} onChange={(event) => setReflection(event.target.value)} placeholder="A sentence is enough. What did this shift for you?" rows={3} aria-label="Add a field note" /><div className="note-save-row"><button className="quiet-button" type="button" onClick={() => onSaveNote(currentDay, reflection)}><Bookmark size={14} /> Save field note</button>{notes.some((note) => note.day === currentDay) && <span className="saved-note-label"><Check size={12} /> saved locally and to your workspace</span>}</div></>}
+          {showReflection && <><textarea value={reflection} onChange={(event) => setReflection(event.target.value)} placeholder="A sentence is enough. What did this shift for you?" rows={3} aria-label="Add a field note" /><div className="note-save-row"><button className="quiet-button" type="button" onClick={() => onSaveNote(currentDay, reflection)}><Bookmark size={14} /> Save field note</button>{notes.some((note) => note.day === currentDay) && <span className="saved-note-label"><Check size={12} /> saved on this device</span>}</div></>}
           <div className="mission-footer"><button className="complete-button" onClick={onComplete}><span className="complete-check"><Check size={14} /></span> Complete this day <ArrowRight size={15} /></button><button className="reflection-button" onClick={() => setShowReflection(!showReflection)}>{showReflection ? 'Hide note' : 'Add a field note'} <Bookmark size={14} /></button></div>
         </> : <div className="review-banner"><Check size={16} /><span>{completed.has(activePreview.day) ? 'You have already completed this focus. Reopen it whenever you want.' : 'Finish your current focus to unlock this mission.'}</span></div>}
       </article>
